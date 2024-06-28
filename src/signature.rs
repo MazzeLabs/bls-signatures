@@ -1,4 +1,5 @@
-use std::{collections::HashSet, io};
+use std::io;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[cfg(feature = "multicore")]
 use rayon::prelude::*;
@@ -6,12 +7,12 @@ use rayon::prelude::*;
 #[cfg(feature = "pairing")]
 use bls12_381::{
     hash_to_curve::{ExpandMsgXmd, HashToCurve},
-    Bls12, G1Affine, G2Affine, G2Projective, Gt, MillerLoopResult,
+    Bls12, G1Affine, G1Projective, G2Affine, G2Projective, Gt, MillerLoopResult,
 };
 use pairing_lib::MultiMillerLoop;
 
 #[cfg(feature = "blst")]
-use blstrs::{Bls12, G1Affine, G2Affine, G2Projective, Gt, MillerLoopResult};
+use blstrs::{Bls12, G1Affine, G1Projective, G2Affine, G2Projective, Gt};
 #[cfg(feature = "blst")]
 use group::{prime::PrimeCurveAffine, Group};
 #[cfg(feature = "blst")]
@@ -21,7 +22,9 @@ use crate::error::Error;
 use crate::key::*;
 
 const CSUITE: &[u8] = b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_NUL_";
+#[allow(unused)]
 const G2_COMPRESSED_SIZE: usize = 96;
+const G2_UNCOMPRESSED_SIZE: usize = 192;
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub struct Signature(G2Affine);
@@ -51,7 +54,7 @@ impl From<Signature> for G2Affine {
 
 impl Serialize for Signature {
     fn write_bytes(&self, dest: &mut impl io::Write) -> io::Result<()> {
-        dest.write_all(&self.0.to_compressed())?;
+        dest.write_all(&self.0.to_uncompressed())?;
 
         Ok(())
     }
@@ -62,7 +65,39 @@ impl Serialize for Signature {
     }
 }
 
+impl DeserializeUnchecked for Signature {
+    fn from_bytes_unchecked(raw: &[u8]) -> Result<Self, Error> {
+        let g2: Result<G2Affine, Error> = if raw.len() == G2_UNCOMPRESSED_SIZE {
+            let mut res = [0u8; G2_UNCOMPRESSED_SIZE];
+            res.copy_from_slice(raw);
+            Option::from(G2Affine::from_uncompressed_unchecked(&res)).ok_or(Error::GroupDecode)
+        } else if raw.len() == G2_COMPRESSED_SIZE {
+            let mut res = [0u8; G2_COMPRESSED_SIZE];
+            res.copy_from_slice(raw);
+            Option::from(G2Affine::from_compressed_unchecked(&res)).ok_or(Error::GroupDecode)
+        } else {
+            Err(Error::SizeMismatch)
+        };
+        Ok(g2?.into())
+    }
+}
+
 fn g2_from_slice(raw: &[u8]) -> Result<G2Affine, Error> {
+    if raw.len() == G2_UNCOMPRESSED_SIZE {
+        let mut res = [0u8; G2_UNCOMPRESSED_SIZE];
+        res.copy_from_slice(raw);
+        Option::from(G2Affine::from_uncompressed(&res)).ok_or(Error::GroupDecode)
+    } else if raw.len() == G2_COMPRESSED_SIZE {
+        let mut res = [0u8; G2_COMPRESSED_SIZE];
+        res.copy_from_slice(raw);
+        Option::from(G2Affine::from_compressed(&res)).ok_or(Error::GroupDecode)
+    } else {
+        Err(Error::SizeMismatch)
+    }
+}
+
+#[allow(unused)]
+fn g2_from_slice_compressed(raw: &[u8]) -> Result<G2Affine, Error> {
     if raw.len() != G2_COMPRESSED_SIZE {
         return Err(Error::SizeMismatch);
     }
@@ -118,8 +153,114 @@ pub fn aggregate(signatures: &[Signature]) -> Result<Signature, Error> {
     Ok(Signature(res.into()))
 }
 
+/// Verifies that the signature is the actual aggregated signature of the same message.
+/// This can only be used if `public_keys` have been proof of possession!!!
+/// Check IETF spec for details:
+/// https://tools.ietf.org/html/draft-irtf-cfrg-bls-signature-02#section-3.3
+///
+/// Calculated by `e(g1, signature) ==  e(\prod_{i = 0}^n pk_i, hash_i)`.
+#[cfg(feature = "pairing")]
+pub fn verify_same(signature: &Signature, h: &G2Projective, public_keys: &[PublicKey]) -> bool {
+    if public_keys.is_empty() {
+        return false;
+    }
+
+    let is_valid = AtomicBool::new(true);
+
+    #[cfg(feature = "multicore")]
+    let aggregate_public_key = public_keys
+        .par_iter()
+        .fold(G1Projective::identity, |mut acc, public_key| {
+            if public_key.0.is_identity().into() {
+                // zero key should fail
+                is_valid.store(false, Ordering::Relaxed);
+            }
+            acc += public_key.0;
+            acc
+        })
+        .reduce(G1Projective::identity, |acc, val| acc + val);
+
+    #[cfg(not(feature = "multicore"))]
+    let aggregate_public_key = public_keys.iter().fold(G1::zero(), |mut acc, public_key| {
+        if public_key.0.is_zero() {
+            // zero key should fail
+            is_valid.store(false, Ordering::Relaxed);
+        }
+        acc.add_assign(&public_key.0);
+        acc
+    });
+
+    if !is_valid.load(Ordering::Relaxed) {
+        return false;
+    }
+
+    let h = G2Affine::from(h);
+    let mut ml = Bls12::multi_miller_loop(&[(&aggregate_public_key.into(), &h.into())]);
+
+    let g1_neg = -G1Affine::generator();
+    ml += Bls12::multi_miller_loop(&[(&g1_neg, &signature.0.into())]);
+
+    ml.final_exponentiation() == Gt::identity()
+}
+
+/// Verifies that the signature is the actual aggregated signature of the same message.
+/// This can only be used if `public_keys` have been proof of possession!!!
+/// Check IETF spec for details:
+/// https://tools.ietf.org/html/draft-irtf-cfrg-bls-signature-02#section-3.3
+///
+/// Calculated by `e(g1, signature) ==  e(\prod_{i = 0}^n pk_i, hash_i)`.
+#[cfg(feature = "blst")]
+pub fn verify_same_message(
+    signature: &Signature,
+    message: &[u8],
+    public_keys: &[PublicKey],
+) -> bool {
+    if public_keys.is_empty() {
+        return false;
+    }
+
+    let h = hash(message);
+    let is_valid = AtomicBool::new(true);
+
+    #[cfg(feature = "multicore")]
+    let aggregate_public_key = public_keys
+        .par_iter()
+        .fold(G1Projective::identity, |mut acc, public_key| {
+            if public_key.0.is_identity().into() {
+                // zero key should fail
+                is_valid.store(false, Ordering::Relaxed);
+            }
+            acc += public_key.0;
+            acc
+        })
+        .reduce(G1Projective::identity, |acc, val| acc + val);
+
+    #[cfg(not(feature = "multicore"))]
+    let aggregate_public_key = public_keys.iter().fold(G1::zero(), |mut acc, public_key| {
+        if public_key.0.is_zero() {
+            // zero key should fail
+            is_valid.store(false, Ordering::Relaxed);
+        }
+        acc.add_assign(&public_key.0);
+        acc
+    });
+
+    if !is_valid.load(Ordering::Relaxed) {
+        return false;
+    }
+
+    let h = G2Affine::from(h);
+    let mut ml = Bls12::multi_miller_loop(&[(&aggregate_public_key.into(), &h.into())]);
+
+    let g1_neg = -G1Affine::generator();
+    ml += Bls12::multi_miller_loop(&[(&g1_neg, &signature.0.into())]);
+
+    ml.final_exponentiation() == Gt::identity()
+}
+
 /// Verifies that the signature is the actual aggregated signature of hashes - pubkeys.
 /// Calculated by `e(g1, signature) == \prod_{i = 0}^n e(pk_i, hash_i)`.
+#[cfg(feature = "pairing")]
 pub fn verify(signature: &Signature, hashes: &[G2Projective], public_keys: &[PublicKey]) -> bool {
     if hashes.is_empty() || public_keys.is_empty() {
         return false;
@@ -131,30 +272,32 @@ pub fn verify(signature: &Signature, hashes: &[G2Projective], public_keys: &[Pub
         return false;
     }
 
-    // zero keys should always fail.
-    if public_keys.iter().any(|pk| pk.0.is_identity().into()) {
+    // zero key & single hash should fail
+    if n_hashes == 1 && public_keys[0].0.is_identity().into() {
         return false;
     }
 
     // Enforce that messages are distinct as a countermeasure against BLS's rogue-key attack.
     // See Section 3.1. of the IRTF's BLS signatures spec:
     // https://tools.ietf.org/html/draft-irtf-cfrg-bls-signature-02#section-3.1
-    if hashes
-        .iter()
-        // This is the best way to get something we can actually hash.
-        .map(|h| G2Affine::from(h).to_compressed())
-        .collect::<HashSet<_>>()
-        .len()
-        != hashes.len()
-    {
-        return false;
+    for i in 0..(n_hashes - 1) {
+        for j in (i + 1)..n_hashes {
+            if hashes[i] == hashes[j] {
+                return false;
+            }
+        }
     }
+
+    let is_valid = AtomicBool::new(true);
 
     #[cfg(feature = "multicore")]
     let mut ml = public_keys
         .par_iter()
         .zip(hashes.par_iter())
         .map(|(pk, h)| {
+            if pk.0.is_identity().into() {
+                is_valid.store(false, Ordering::Relaxed);
+            }
             let pk = pk.as_affine();
             let h = G2Affine::from(h).into();
             Bls12::multi_miller_loop(&[(&pk, &h)])
@@ -166,17 +309,37 @@ pub fn verify(signature: &Signature, hashes: &[G2Projective], public_keys: &[Pub
         .iter()
         .zip(hashes.iter())
         .map(|(pk, h)| {
+            if pk.0.is_identity().into() {
+                is_valid.store(false, Ordering::Relaxed);
+            }
             let pk = pk.as_affine();
             let h = G2Affine::from(h).into();
             Bls12::multi_miller_loop(&[(&pk, &h)])
         })
         .fold(MillerLoopResult::default(), |acc, cur| acc + cur);
 
+    if !is_valid.load(Ordering::Relaxed) {
+        return false;
+    }
+
     let g1_neg = -G1Affine::generator();
 
     ml += Bls12::multi_miller_loop(&[(&g1_neg, &signature.0.into())]);
 
     ml.final_exponentiation() == Gt::identity()
+}
+
+/// Verifies that the signature is the actual aggregated signature of messages - pubkeys.
+/// Calculated by `e(g1, signature) ==  e(\prod_{i = 0}^n pk_i, hash_i)`.
+#[cfg(feature = "pairing")]
+pub fn verify_same_message(
+    signature: &Signature,
+    message: &[u8],
+    public_keys: &[PublicKey],
+) -> bool {
+    let h = hash(message);
+
+    verify_same(signature, &h, public_keys)
 }
 
 /// Verifies that the signature is the actual aggregated signature of messages - pubkeys.
@@ -204,8 +367,6 @@ pub fn verify_messages(
     messages: &[&[u8]],
     public_keys: &[PublicKey],
 ) -> bool {
-    use blst_lib::BLST_ERROR;
-
     if messages.is_empty() || public_keys.is_empty() {
         return false;
     }
@@ -228,31 +389,45 @@ pub fn verify_messages(
         return false;
     }
 
+    let valid = AtomicBool::new(true);
+
     let n_workers = std::cmp::min(rayon::current_num_threads(), n_messages);
-    let Some(Ok(acc)) = messages
+    let mut pairings = messages
         .par_iter()
         .zip(public_keys.par_iter())
         .chunks(n_messages / n_workers)
-        .map(|chunk| -> Result<_, BLST_ERROR> {
+        .map(|chunk| {
             let mut pairing = blstrs::PairingG1G2::new(true, CSUITE);
 
             for (message, public_key) in chunk {
-                pairing.aggregate(&public_key.0.into(), None, message, &[])?;
+                let res = pairing.aggregate(&public_key.0.into(), None, message, &[]);
+                if res.is_err() {
+                    valid.store(false, Ordering::Relaxed);
+                    break;
+                }
             }
-            pairing.commit();
-            Ok(pairing)
+            if valid.load(Ordering::Relaxed) {
+                pairing.commit();
+            }
+
+            pairing
         })
-        .try_reduce_with(|mut acc, pairing| -> Result<_, BLST_ERROR> {
-            acc.merge(&pairing)?;
-            Ok(acc)
-        })
-    else {
-        return false;
-    };
+        .collect::<Vec<_>>();
 
     let mut gtsig = Gt::default();
-    blstrs::PairingG1G2::aggregated(&mut gtsig, &signature.0);
-    acc.finalverify(Some(&gtsig))
+    if valid.load(Ordering::Relaxed) {
+        blstrs::PairingG1G2::aggregated(&mut gtsig, &signature.0);
+    }
+
+    let mut acc = pairings.pop().unwrap();
+    for pairing in &pairings {
+        let res = acc.merge(pairing);
+        if res.is_err() {
+            return false;
+        }
+    }
+
+    valid.load(Ordering::Relaxed) && acc.finalverify(Some(&gtsig))
 }
 
 /// Verifies that the signature is the actual aggregated signature of messages - pubkeys.
@@ -285,21 +460,24 @@ pub fn verify_messages(
         return false;
     }
 
+    let mut valid = true;
     let mut pairing = blstrs::PairingG1G2::new(true, CSUITE);
     for (message, public_key) in messages.iter().zip(public_keys.iter()) {
-        if pairing
-            .aggregate(&public_key.0.into(), None, message, &[])
-            .is_err()
-        {
-            return false;
+        let res = pairing.aggregate(&public_key.0.into(), None, message, &[]);
+        if res.is_err() {
+            valid = false;
+            break;
         }
+
         pairing.commit();
     }
 
     let mut gtsig = Gt::default();
-    blstrs::PairingG1G2::aggregated(&mut gtsig, &signature.0);
+    if valid {
+        blstrs::PairingG1G2::aggregated(&mut gtsig, &signature.0);
+    }
 
-    pairing.finalverify(Some(&gtsig))
+    valid && pairing.finalverify(Some(&gtsig))
 }
 
 #[cfg(test)]
@@ -344,19 +522,10 @@ mod tests {
 
         let aggregated_signature = aggregate(&sigs).expect("failed to aggregate");
 
-        let hashes = messages
-            .iter()
-            .map(|message| hash(message))
-            .collect::<Vec<_>>();
         let public_keys = private_keys
             .iter()
             .map(|pk| pk.public_key())
             .collect::<Vec<_>>();
-
-        assert!(
-            verify(&aggregated_signature, &hashes, &public_keys),
-            "failed to verify"
-        );
 
         let messages = messages.iter().map(|r| &r[..]).collect::<Vec<_>>();
         assert!(verify_messages(
@@ -389,15 +558,11 @@ mod tests {
         let aggregated_signature = aggregate(&sigs).expect("failed to aggregate");
 
         // check that equal messages can not be aggreagated
-        let hashes: Vec<_> = (0..num_messages).map(|_| hash(&message)).collect();
         let public_keys = private_keys
             .iter()
             .map(|pk| pk.public_key())
             .collect::<Vec<_>>();
-        assert!(
-            !verify(&aggregated_signature, &hashes, &public_keys),
-            "must not verify aggregate with the same messages"
-        );
+
         let messages = vec![&message[..]; num_messages];
 
         assert!(!verify_messages(
@@ -452,11 +617,6 @@ mod tests {
             .map(|pk| pk.public_key())
             .collect::<Vec<_>>();
 
-        assert!(
-            !verify(&aggregated_signature, &hashes, &public_keys),
-            "verified with zero key"
-        );
-
         let messages = messages.iter().map(|r| &r[..]).collect::<Vec<_>>();
         assert!(!verify_messages(
             &aggregated_signature,
@@ -486,7 +646,8 @@ mod tests {
         let signature = sk.sign(&msg);
 
         let signature_bytes = signature.as_bytes();
-        assert_eq!(signature_bytes.len(), 96);
+        // Signature is serialized as G2Uncompressed.
+        assert_eq!(signature_bytes.len(), 192);
         assert_eq!(Signature::from_bytes(&signature_bytes).unwrap(), signature);
     }
 
@@ -557,7 +718,9 @@ mod tests {
                 hash_to_g1(case.msg.as_bytes(), case.ciphersuite.as_bytes())
             );
 
-            let g2: G2Projective = g2_from_slice(&case.g2_compressed).unwrap().into();
+            let g2: G2Projective = g2_from_slice_compressed(&case.g2_compressed)
+                .unwrap()
+                .into();
             assert_eq!(
                 g2,
                 hash_to_g2(case.msg.as_bytes(), case.ciphersuite.as_bytes())
@@ -568,10 +731,13 @@ mod tests {
                     PublicKey::from_bytes(&base64::decode(case.pub_key.as_ref().unwrap()).unwrap())
                         .unwrap();
                 let priv_key = PrivateKey::from_string(case.priv_key.as_ref().unwrap()).unwrap();
-                let signature = Signature::from_bytes(
-                    &base64::decode(case.signature.as_ref().unwrap()).unwrap(),
-                )
-                .unwrap();
+                let signature = Signature(
+                    g2_from_slice_compressed(
+                        &base64::decode(case.signature.as_ref().unwrap()).unwrap(),
+                    )
+                    .unwrap()
+                    .into(),
+                );
 
                 let sig2 = priv_key.sign(&case.msg);
                 assert_eq!(signature, sig2, "signatures do not match");
@@ -579,5 +745,40 @@ mod tests {
                 assert!(pub_key.verify(signature, &case.msg), "failed to verify");
             }
         }
+    }
+
+    #[test]
+    fn verify_same_messages() {
+        let mut rng = ChaCha8Rng::seed_from_u64(12);
+
+        let num_messages = 10;
+
+        // generate private keys
+        let private_keys: Vec<_> = (0..num_messages)
+            .map(|_| PrivateKey::generate(&mut rng))
+            .collect();
+
+        // generate messages
+        let message: Vec<u8> = (0..64).map(|_| rng.gen()).collect();
+
+        // sign messages
+        let sigs = private_keys
+            .iter()
+            .map(|pk| pk.sign(&message))
+            .collect::<Vec<Signature>>();
+
+        let aggregated_signature = aggregate(&sigs).expect("failed to aggregate");
+
+        let public_keys = private_keys
+            .iter()
+            .map(|pk| pk.public_key())
+            .collect::<Vec<_>>();
+
+        assert!(verify_same_message(
+            &aggregated_signature,
+            &message,
+            &public_keys
+        ));
+        assert!(!verify_same_message(&sigs[0], &message, &public_keys));
     }
 }
